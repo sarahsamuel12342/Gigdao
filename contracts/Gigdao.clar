@@ -14,10 +14,18 @@
 (define-constant ERR_INVALID_RATING (err u107))
 (define-constant ERR_ALREADY_RATED (err u108))
 (define-constant ERR_DISPUTE_PERIOD_ACTIVE (err u109))
+(define-constant ERR_INVALID_TEMPLATE (err u110))
+(define-constant ERR_TEMPLATE_NOT_ACTIVE (err u111))
+(define-constant ERR_INSUFFICIENT_REPUTATION (err u112))
+(define-constant ERR_INVALID_CATEGORY (err u113))
+(define-constant ERR_TEMPLATE_LIMIT_REACHED (err u114))
 
 (define-data-var next-gig-id uint u1)
 (define-data-var platform-fee-rate uint u250)
 (define-data-var dispute-period uint u144)
+(define-data-var next-template-id uint u1)
+(define-data-var max-templates-per-user uint u10)
+(define-data-var min-reputation-for-templates uint u50)
 
 (define-map gigs
   { gig-id: uint }
@@ -76,6 +84,71 @@
 (define-map escrow-balances
   { gig-id: uint }
   { amount: uint }
+)
+
+(define-map gig-templates
+  { template-id: uint }
+  {
+    creator: principal,
+    category: (string-ascii 50),
+    title-template: (string-ascii 100),
+    description-template: (string-ascii 500),
+    suggested-payment-min: uint,
+    suggested-payment-max: uint,
+    required-skills: (list 5 (string-ascii 30)),
+    estimated-duration: uint,
+    difficulty-level: uint,
+    usage-count: uint,
+    success-rate: uint,
+    avg-completion-time: uint,
+    created-at: uint,
+    is-active: bool,
+    tags: (list 10 (string-ascii 20))
+  }
+)
+
+(define-map template-recommendations
+  { user: principal, template-id: uint }
+  {
+    compatibility-score: uint,
+    price-recommendation: uint,
+    timeline-recommendation: uint,
+    success-probability: uint,
+    recommended-at: uint
+  }
+)
+
+(define-map user-template-usage
+  { user: principal, template-id: uint }
+  {
+    times-used: uint,
+    success-rate: uint,
+    avg-rating: uint,
+    last-used: uint
+  }
+)
+
+(define-map category-stats
+  { category: (string-ascii 50) }
+  {
+    total-gigs: uint,
+    avg-payment: uint,
+    avg-completion-time: uint,
+    success-rate: uint,
+    top-skills: (list 5 (string-ascii 30))
+  }
+)
+
+(define-map user-preferences
+  { user: principal }
+  {
+    preferred-categories: (list 5 (string-ascii 50)),
+    preferred-payment-range-min: uint,
+    preferred-payment-range-max: uint,
+    preferred-skills: (list 10 (string-ascii 30)),
+    notification-settings: uint,
+    template-count: uint
+  }
 )
 
 (define-public (create-gig (title (string-ascii 100)) (description (string-ascii 500)) (payment uint))
@@ -310,4 +383,273 @@
 
 (define-read-only (get-platform-fee-rate)
   (var-get platform-fee-rate)
+)
+
+(define-public (create-gig-template 
+  (category (string-ascii 50))
+  (title-template (string-ascii 100))
+  (description-template (string-ascii 500))
+  (suggested-payment-min uint)
+  (suggested-payment-max uint)
+  (required-skills (list 5 (string-ascii 30)))
+  (estimated-duration uint)
+  (difficulty-level uint)
+  (tags (list 10 (string-ascii 20))))
+  (let
+    (
+      (template-id (var-get next-template-id))
+      (current-block stacks-block-height)
+      (user-profile (default-to 
+        { total-gigs: u0, completed-gigs: u0, total-earnings: u0, average-rating: u0, rating-count: u0, reputation-score: u0 }
+        (map-get? freelancer-profiles { freelancer: tx-sender })))
+      (user-prefs (default-to
+        { preferred-categories: (list), preferred-payment-range-min: u0, preferred-payment-range-max: u0, preferred-skills: (list), notification-settings: u0, template-count: u0 }
+        (map-get? user-preferences { user: tx-sender })))
+    )
+    (asserts! (>= (get reputation-score user-profile) (var-get min-reputation-for-templates)) ERR_INSUFFICIENT_REPUTATION)
+    (asserts! (< (get template-count user-prefs) (var-get max-templates-per-user)) ERR_TEMPLATE_LIMIT_REACHED)
+    (asserts! (and (>= difficulty-level u1) (<= difficulty-level u5)) ERR_INVALID_CATEGORY)
+    (asserts! (<= suggested-payment-min suggested-payment-max) ERR_INVALID_GIG)
+    (map-set gig-templates
+      { template-id: template-id }
+      {
+        creator: tx-sender,
+        category: category,
+        title-template: title-template,
+        description-template: description-template,
+        suggested-payment-min: suggested-payment-min,
+        suggested-payment-max: suggested-payment-max,
+        required-skills: required-skills,
+        estimated-duration: estimated-duration,
+        difficulty-level: difficulty-level,
+        usage-count: u0,
+        success-rate: u100,
+        avg-completion-time: estimated-duration,
+        created-at: current-block,
+        is-active: true,
+        tags: tags
+      }
+    )
+    (map-set user-preferences
+      { user: tx-sender }
+      (merge user-prefs { template-count: (+ (get template-count user-prefs) u1) })
+    )
+    (var-set next-template-id (+ template-id u1))
+    (ok template-id)
+  )
+)
+
+(define-public (create-gig-from-template (template-id uint) (custom-payment uint))
+  (let
+    (
+      (template (unwrap! (map-get? gig-templates { template-id: template-id }) ERR_INVALID_TEMPLATE))
+      (gig-id (var-get next-gig-id))
+      (current-block stacks-block-height)
+      (final-payment (if (and (>= custom-payment (get suggested-payment-min template)) 
+                             (<= custom-payment (get suggested-payment-max template)))
+                        custom-payment
+                        (/ (+ (get suggested-payment-min template) (get suggested-payment-max template)) u2)))
+    )
+    (asserts! (get is-active template) ERR_TEMPLATE_NOT_ACTIVE)
+    (try! (stx-transfer? final-payment tx-sender (as-contract tx-sender)))
+    (map-set gigs
+      { gig-id: gig-id }
+      {
+        client: tx-sender,
+        freelancer: none,
+        title: (get title-template template),
+        description: (get description-template template),
+        payment: final-payment,
+        status: "open",
+        created-at: current-block,
+        completed-at: none,
+        disputed: false
+      }
+    )
+    (map-set escrow-balances { gig-id: gig-id } { amount: final-payment })
+    (map-set user-template-usage
+      { user: tx-sender, template-id: template-id }
+      (merge
+        (default-to
+          { times-used: u0, success-rate: u100, avg-rating: u0, last-used: u0 }
+          (map-get? user-template-usage { user: tx-sender, template-id: template-id })
+        )
+        { 
+          times-used: (+ (get times-used (default-to { times-used: u0, success-rate: u100, avg-rating: u0, last-used: u0 } (map-get? user-template-usage { user: tx-sender, template-id: template-id }))) u1),
+          last-used: current-block
+        }
+      )
+    )
+    (map-set gig-templates
+      { template-id: template-id }
+      (merge template { usage-count: (+ (get usage-count template) u1) })
+    )
+    (let
+      (
+        (client-profile (default-to
+          { total-gigs-posted: u0, total-spent: u0, average-rating: u0, rating-count: u0 }
+          (map-get? client-profiles { client: tx-sender })
+        ))
+      )
+      (map-set client-profiles
+        { client: tx-sender }
+        (merge client-profile { total-gigs-posted: (+ (get total-gigs-posted client-profile) u1) })
+      )
+    )
+    (var-set next-gig-id (+ gig-id u1))
+    (ok gig-id)
+  )
+)
+
+(define-public (generate-template-recommendations (user principal) (category (string-ascii 50)))
+  (let
+    (
+      (user-profile (default-to 
+        { total-gigs: u0, completed-gigs: u0, total-earnings: u0, average-rating: u0, rating-count: u0, reputation-score: u0 }
+        (map-get? freelancer-profiles { freelancer: user })))
+      (user-prefs (default-to
+        { preferred-categories: (list), preferred-payment-range-min: u0, preferred-payment-range-max: u1000000, preferred-skills: (list), notification-settings: u0, template-count: u0 }
+        (map-get? user-preferences { user: user })))
+      (current-block stacks-block-height)
+      (category-data (default-to
+        { total-gigs: u1, avg-payment: u100000, avg-completion-time: u100, success-rate: u80, top-skills: (list) }
+        (map-get? category-stats { category: category })))
+    )
+    (let
+      (
+        (base-compatibility (+ (get reputation-score user-profile) (* (get completed-gigs user-profile) u5)))
+        (payment-compatibility (if (and (>= (get avg-payment category-data) (get preferred-payment-range-min user-prefs))
+                                       (<= (get avg-payment category-data) (get preferred-payment-range-max user-prefs)))
+                                  u25 u10))
+        (experience-bonus (if (> (* (get completed-gigs user-profile) u2) u30) u30 (* (get completed-gigs user-profile) u2)))
+        (total-compatibility (+ base-compatibility payment-compatibility experience-bonus))
+        (payment-choice (if (< (get avg-payment category-data) (get preferred-payment-range-max user-prefs)) 
+                          (get avg-payment category-data) 
+                          (get preferred-payment-range-max user-prefs)))
+        (recommended-payment (if (> (get preferred-payment-range-min user-prefs) payment-choice) 
+                               (get preferred-payment-range-min user-prefs) 
+                               payment-choice))
+        (timeline-estimate (+ (get avg-completion-time category-data) 
+                             (if (> (get reputation-score user-profile) u100) u0 u20)))
+        (temp-success (+ (get success-rate category-data) (/ (get reputation-score user-profile) u10)))
+        (success-prob (if (> temp-success u100) u100 temp-success))
+      )
+      (map-set template-recommendations
+        { user: user, template-id: u0 }
+        {
+          compatibility-score: total-compatibility,
+          price-recommendation: recommended-payment,
+          timeline-recommendation: timeline-estimate,
+          success-probability: success-prob,
+          recommended-at: current-block
+        }
+      )
+      (ok {
+        compatibility: total-compatibility,
+        price: recommended-payment,
+        timeline: timeline-estimate,
+        success-rate: success-prob
+      })
+    )
+  )
+)
+
+(define-public (update-category-stats (category (string-ascii 50)) (payment uint) (completion-time uint) (success bool))
+  (let
+    (
+      (current-stats (default-to
+        { total-gigs: u0, avg-payment: u0, avg-completion-time: u0, success-rate: u100, top-skills: (list) }
+        (map-get? category-stats { category: category })))
+      (new-total (+ (get total-gigs current-stats) u1))
+      (new-avg-payment (/ (+ (* (get avg-payment current-stats) (get total-gigs current-stats)) payment) new-total))
+      (new-avg-time (/ (+ (* (get avg-completion-time current-stats) (get total-gigs current-stats)) completion-time) new-total))
+      (success-count (if success 
+                       (+ (/ (* (get success-rate current-stats) (get total-gigs current-stats)) u100) u1)
+                       (/ (* (get success-rate current-stats) (get total-gigs current-stats)) u100)))
+      (new-success-rate (/ (* success-count u100) new-total))
+    )
+    (map-set category-stats
+      { category: category }
+      {
+        total-gigs: new-total,
+        avg-payment: new-avg-payment,
+        avg-completion-time: new-avg-time,
+        success-rate: new-success-rate,
+        top-skills: (get top-skills current-stats)
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (set-user-preferences 
+  (preferred-categories (list 5 (string-ascii 50)))
+  (payment-min uint)
+  (payment-max uint)
+  (preferred-skills (list 10 (string-ascii 30)))
+  (notifications uint))
+  (let
+    (
+      (current-prefs (default-to
+        { preferred-categories: (list), preferred-payment-range-min: u0, preferred-payment-range-max: u0, preferred-skills: (list), notification-settings: u0, template-count: u0 }
+        (map-get? user-preferences { user: tx-sender })))
+    )
+    (asserts! (<= payment-min payment-max) ERR_INVALID_GIG)
+    (map-set user-preferences
+      { user: tx-sender }
+      (merge current-prefs {
+        preferred-categories: preferred-categories,
+        preferred-payment-range-min: payment-min,
+        preferred-payment-range-max: payment-max,
+        preferred-skills: preferred-skills,
+        notification-settings: notifications
+      })
+    )
+    (ok true)
+  )
+)
+
+(define-public (toggle-template-status (template-id uint))
+  (let
+    (
+      (template (unwrap! (map-get? gig-templates { template-id: template-id }) ERR_INVALID_TEMPLATE))
+    )
+    (asserts! (is-eq (get creator template) tx-sender) ERR_NOT_AUTHORIZED)
+    (map-set gig-templates
+      { template-id: template-id }
+      (merge template { is-active: (not (get is-active template)) })
+    )
+    (ok (not (get is-active template)))
+  )
+)
+
+(define-read-only (get-template (template-id uint))
+  (map-get? gig-templates { template-id: template-id })
+)
+
+(define-read-only (get-template-recommendation (user principal) (template-id uint))
+  (map-get? template-recommendations { user: user, template-id: template-id })
+)
+
+(define-read-only (get-user-template-usage (user principal) (template-id uint))
+  (map-get? user-template-usage { user: user, template-id: template-id })
+)
+
+(define-read-only (get-category-stats (category (string-ascii 50)))
+  (map-get? category-stats { category: category })
+)
+
+(define-read-only (get-user-preferences (user principal))
+  (map-get? user-preferences { user: user })
+)
+
+(define-read-only (get-next-template-id)
+  (var-get next-template-id)
+)
+
+(define-read-only (get-template-settings)
+  {
+    max-templates-per-user: (var-get max-templates-per-user),
+    min-reputation-for-templates: (var-get min-reputation-for-templates)
+  }
 )
