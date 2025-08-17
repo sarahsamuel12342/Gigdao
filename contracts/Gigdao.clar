@@ -19,6 +19,13 @@
 (define-constant ERR_INSUFFICIENT_REPUTATION (err u112))
 (define-constant ERR_INVALID_CATEGORY (err u113))
 (define-constant ERR_TEMPLATE_LIMIT_REACHED (err u114))
+(define-constant ERR_SKILL_NOT_FOUND (err u115))
+(define-constant ERR_CHALLENGE_NOT_ACTIVE (err u116))
+(define-constant ERR_ALREADY_VERIFIED (err u117))
+(define-constant ERR_INSUFFICIENT_REVIEWERS (err u118))
+(define-constant ERR_INVALID_VERIFICATION (err u119))
+(define-constant ERR_CERTIFICATION_EXPIRED (err u120))
+(define-constant ERR_ALREADY_REVIEWED (err u121))
 
 (define-data-var next-gig-id uint u1)
 (define-data-var platform-fee-rate uint u250)
@@ -26,6 +33,10 @@
 (define-data-var next-template-id uint u1)
 (define-data-var max-templates-per-user uint u10)
 (define-data-var min-reputation-for-templates uint u50)
+(define-data-var next-skill-id uint u1)
+(define-data-var next-challenge-id uint u1)
+(define-data-var min-reviewers-for-verification uint u3)
+(define-data-var certification-validity-period uint u52560)
 
 (define-map gigs
   { gig-id: uint }
@@ -148,6 +159,85 @@
     preferred-skills: (list 10 (string-ascii 30)),
     notification-settings: uint,
     template-count: uint
+  }
+)
+
+(define-map skill-definitions
+  { skill-id: uint }
+  {
+    name: (string-ascii 50),
+    category: (string-ascii 30),
+    description: (string-ascii 200),
+    verification-type: (string-ascii 20),
+    creator: principal,
+    difficulty-level: uint,
+    min-reputation-required: uint,
+    created-at: uint,
+    is-active: bool,
+    total-verifications: uint
+  }
+)
+
+(define-map skill-certifications
+  { freelancer: principal, skill-id: uint }
+  {
+    verification-method: (string-ascii 20),
+    certified-at: uint,
+    expires-at: uint,
+    proficiency-level: uint,
+    verification-score: uint,
+    reviewer-count: uint,
+    is-active: bool
+  }
+)
+
+(define-map skill-challenges
+  { challenge-id: uint }
+  {
+    skill-id: uint,
+    creator: principal,
+    title: (string-ascii 100),
+    description: (string-ascii 300),
+    requirements: (string-ascii 200),
+    reward-points: uint,
+    difficulty: uint,
+    created-at: uint,
+    deadline: uint,
+    is-active: bool,
+    participant-count: uint
+  }
+)
+
+(define-map challenge-submissions
+  { challenge-id: uint, participant: principal }
+  {
+    submission-data: (string-ascii 500),
+    submitted-at: uint,
+    status: (string-ascii 20),
+    score: uint,
+    reviewer-count: uint,
+    verified: bool
+  }
+)
+
+(define-map peer-reviews
+  { skill-id: uint, candidate: principal, reviewer: principal }
+  {
+    review-score: uint,
+    review-notes: (string-ascii 300),
+    reviewed-at: uint,
+    verification-type: (string-ascii 20)
+  }
+)
+
+(define-map freelancer-skill-portfolio
+  { freelancer: principal }
+  {
+    verified-skills: (list 20 uint),
+    total-certifications: uint,
+    portfolio-score: uint,
+    last-updated: uint,
+    skill-points: uint
   }
 )
 
@@ -653,3 +743,296 @@
     min-reputation-for-templates: (var-get min-reputation-for-templates)
   }
 )
+
+(define-public (create-skill-definition 
+  (name (string-ascii 50))
+  (category (string-ascii 30))
+  (description (string-ascii 200))
+  (verification-type (string-ascii 20))
+  (difficulty-level uint)
+  (min-reputation-required uint))
+  (let
+    (
+      (skill-id (var-get next-skill-id))
+      (current-block stacks-block-height)
+      (creator-profile (default-to 
+        { total-gigs: u0, completed-gigs: u0, total-earnings: u0, average-rating: u0, rating-count: u0, reputation-score: u0 }
+        (map-get? freelancer-profiles { freelancer: tx-sender })))
+    )
+    (asserts! (>= (get reputation-score creator-profile) u100) ERR_INSUFFICIENT_REPUTATION)
+    (asserts! (and (>= difficulty-level u1) (<= difficulty-level u5)) ERR_INVALID_CATEGORY)
+    (map-set skill-definitions
+      { skill-id: skill-id }
+      {
+        name: name,
+        category: category,
+        description: description,
+        verification-type: verification-type,
+        creator: tx-sender,
+        difficulty-level: difficulty-level,
+        min-reputation-required: min-reputation-required,
+        created-at: current-block,
+        is-active: true,
+        total-verifications: u0
+      }
+    )
+    (var-set next-skill-id (+ skill-id u1))
+    (ok skill-id)
+  )
+)
+
+(define-public (create-skill-challenge
+  (skill-id uint)
+  (title (string-ascii 100))
+  (description (string-ascii 300))
+  (requirements (string-ascii 200))
+  (reward-points uint)
+  (difficulty uint)
+  (duration-blocks uint))
+  (let
+    (
+      (challenge-id (var-get next-challenge-id))
+      (current-block stacks-block-height)
+      (skill (unwrap! (map-get? skill-definitions { skill-id: skill-id }) ERR_SKILL_NOT_FOUND))
+      (creator-profile (default-to 
+        { total-gigs: u0, completed-gigs: u0, total-earnings: u0, average-rating: u0, rating-count: u0, reputation-score: u0 }
+        (map-get? freelancer-profiles { freelancer: tx-sender })))
+    )
+    (asserts! (get is-active skill) ERR_SKILL_NOT_FOUND)
+    (asserts! (>= (get reputation-score creator-profile) u50) ERR_INSUFFICIENT_REPUTATION)
+    (asserts! (and (>= difficulty u1) (<= difficulty u5)) ERR_INVALID_CATEGORY)
+    (map-set skill-challenges
+      { challenge-id: challenge-id }
+      {
+        skill-id: skill-id,
+        creator: tx-sender,
+        title: title,
+        description: description,
+        requirements: requirements,
+        reward-points: reward-points,
+        difficulty: difficulty,
+        created-at: current-block,
+        deadline: (+ current-block duration-blocks),
+        is-active: true,
+        participant-count: u0
+      }
+    )
+    (var-set next-challenge-id (+ challenge-id u1))
+    (ok challenge-id)
+  )
+)
+
+(define-public (submit-challenge-solution 
+  (challenge-id uint)
+  (submission-data (string-ascii 500)))
+  (let
+    (
+      (challenge (unwrap! (map-get? skill-challenges { challenge-id: challenge-id }) ERR_INVALID_GIG))
+      (current-block stacks-block-height)
+    )
+    (asserts! (get is-active challenge) ERR_CHALLENGE_NOT_ACTIVE)
+    (asserts! (< current-block (get deadline challenge)) ERR_CHALLENGE_NOT_ACTIVE)
+    (asserts! (is-none (map-get? challenge-submissions { challenge-id: challenge-id, participant: tx-sender })) ERR_ALREADY_COMPLETED)
+    (map-set challenge-submissions
+      { challenge-id: challenge-id, participant: tx-sender }
+      {
+        submission-data: submission-data,
+        submitted-at: current-block,
+        status: "pending",
+        score: u0,
+        reviewer-count: u0,
+        verified: false
+      }
+    )
+    (map-set skill-challenges
+      { challenge-id: challenge-id }
+      (merge challenge { participant-count: (+ (get participant-count challenge) u1) })
+    )
+    (ok true)
+  )
+)
+
+(define-public (review-challenge-submission
+  (challenge-id uint)
+  (participant principal)
+  (score uint)
+  (review-notes (string-ascii 300)))
+  (let
+    (
+      (challenge (unwrap! (map-get? skill-challenges { challenge-id: challenge-id }) ERR_INVALID_GIG))
+      (submission (unwrap! (map-get? challenge-submissions { challenge-id: challenge-id, participant: participant }) ERR_INVALID_GIG))
+      (reviewer-profile (default-to 
+        { total-gigs: u0, completed-gigs: u0, total-earnings: u0, average-rating: u0, rating-count: u0, reputation-score: u0 }
+        (map-get? freelancer-profiles { freelancer: tx-sender })))
+      (current-block stacks-block-height)
+    )
+    (asserts! (not (is-eq tx-sender participant)) ERR_NOT_AUTHORIZED)
+    (asserts! (>= (get reputation-score reviewer-profile) u50) ERR_INSUFFICIENT_REPUTATION)
+    (asserts! (and (>= score u0) (<= score u100)) ERR_INVALID_RATING)
+    (asserts! (is-none (map-get? peer-reviews { skill-id: (get skill-id challenge), candidate: participant, reviewer: tx-sender })) ERR_ALREADY_REVIEWED)
+    (map-set peer-reviews
+      { skill-id: (get skill-id challenge), candidate: participant, reviewer: tx-sender }
+      {
+        review-score: score,
+        review-notes: review-notes,
+        reviewed-at: current-block,
+        verification-type: "challenge"
+      }
+    )
+    (let
+      (
+        (new-reviewer-count (+ (get reviewer-count submission) u1))
+        (new-score (/ (+ (* (get score submission) (get reviewer-count submission)) score) new-reviewer-count))
+      )
+      (map-set challenge-submissions
+        { challenge-id: challenge-id, participant: participant }
+        (merge submission {
+          score: new-score,
+          reviewer-count: new-reviewer-count,
+          verified: (>= new-reviewer-count (var-get min-reviewers-for-verification))
+        })
+      )
+    )
+    (ok true)
+  )
+)
+
+(define-public (verify-skill-through-peer-review
+  (skill-id uint)
+  (candidate principal))
+  (let
+    (
+      (skill (unwrap! (map-get? skill-definitions { skill-id: skill-id }) ERR_SKILL_NOT_FOUND))
+      (reviewer-profile (default-to 
+        { total-gigs: u0, completed-gigs: u0, total-earnings: u0, average-rating: u0, rating-count: u0, reputation-score: u0 }
+        (map-get? freelancer-profiles { freelancer: tx-sender })))
+      (candidate-profile (default-to 
+        { total-gigs: u0, completed-gigs: u0, total-earnings: u0, average-rating: u0, rating-count: u0, reputation-score: u0 }
+        (map-get? freelancer-profiles { freelancer: candidate })))
+      (current-block stacks-block-height)
+    )
+    (asserts! (not (is-eq tx-sender candidate)) ERR_NOT_AUTHORIZED)
+    (asserts! (>= (get reputation-score reviewer-profile) u100) ERR_INSUFFICIENT_REPUTATION)
+    (asserts! (>= (get reputation-score candidate-profile) (get min-reputation-required skill)) ERR_INSUFFICIENT_REPUTATION)
+    (asserts! (get is-active skill) ERR_SKILL_NOT_FOUND)
+    (asserts! (is-none (map-get? skill-certifications { freelancer: candidate, skill-id: skill-id })) ERR_ALREADY_VERIFIED)
+    (asserts! (is-none (map-get? peer-reviews { skill-id: skill-id, candidate: candidate, reviewer: tx-sender })) ERR_ALREADY_REVIEWED)
+    (map-set peer-reviews
+      { skill-id: skill-id, candidate: candidate, reviewer: tx-sender }
+      {
+        review-score: u75,
+        review-notes: "Peer verification",
+        reviewed-at: current-block,
+        verification-type: "peer-review"
+      }
+    )
+    (ok true)
+  )
+)
+
+(define-public (issue-skill-certification
+  (skill-id uint)
+  (freelancer principal)
+  (verification-method (string-ascii 20))
+  (proficiency-level uint))
+  (let
+    (
+      (skill (unwrap! (map-get? skill-definitions { skill-id: skill-id }) ERR_SKILL_NOT_FOUND))
+      (current-block stacks-block-height)
+      (expiry-block (+ current-block (var-get certification-validity-period)))
+      (existing-cert (map-get? skill-certifications { freelancer: freelancer, skill-id: skill-id }))
+    )
+    (asserts! (get is-active skill) ERR_SKILL_NOT_FOUND)
+    (asserts! (and (>= proficiency-level u1) (<= proficiency-level u5)) ERR_INVALID_CATEGORY)
+    (asserts! (or (is-eq tx-sender (get creator skill)) (is-eq tx-sender CONTRACT_OWNER)) ERR_NOT_AUTHORIZED)
+    (asserts! (is-none existing-cert) ERR_ALREADY_VERIFIED)
+    (map-set skill-certifications
+      { freelancer: freelancer, skill-id: skill-id }
+      {
+        verification-method: verification-method,
+        certified-at: current-block,
+        expires-at: expiry-block,
+        proficiency-level: proficiency-level,
+        verification-score: u85,
+        reviewer-count: u1,
+        is-active: true
+      }
+    )
+    (map-set skill-definitions
+      { skill-id: skill-id }
+      (merge skill { total-verifications: (+ (get total-verifications skill) u1) })
+    )
+    (let
+      (
+        (portfolio (default-to
+          { verified-skills: (list), total-certifications: u0, portfolio-score: u0, last-updated: u0, skill-points: u0 }
+          (map-get? freelancer-skill-portfolio { freelancer: freelancer })))
+        (current-skills (get verified-skills portfolio))
+        (updated-skills (unwrap! (as-max-len? (append current-skills skill-id) u20) ERR_TEMPLATE_LIMIT_REACHED))
+      )
+      (map-set freelancer-skill-portfolio
+        { freelancer: freelancer }
+        {
+          verified-skills: updated-skills,
+          total-certifications: (+ (get total-certifications portfolio) u1),
+          portfolio-score: (+ (get portfolio-score portfolio) (* proficiency-level u20)),
+          last-updated: current-block,
+          skill-points: (+ (get skill-points portfolio) (* (get difficulty-level skill) u10))
+        }
+      )
+    )
+    (ok true)
+  )
+)
+
+(define-public (renew-skill-certification (skill-id uint))
+  (let
+    (
+      (cert (unwrap! (map-get? skill-certifications { freelancer: tx-sender, skill-id: skill-id }) ERR_SKILL_NOT_FOUND))
+      (current-block stacks-block-height)
+      (new-expiry (+ current-block (var-get certification-validity-period)))
+    )
+    (asserts! (get is-active cert) ERR_CERTIFICATION_EXPIRED)
+    (asserts! (> current-block (- (get expires-at cert) u1440)) ERR_INVALID_VERIFICATION)
+    (map-set skill-certifications
+      { freelancer: tx-sender, skill-id: skill-id }
+      (merge cert { expires-at: new-expiry })
+    )
+    (ok true)
+  )
+)
+
+(define-read-only (get-skill-definition (skill-id uint))
+  (map-get? skill-definitions { skill-id: skill-id })
+)
+
+(define-read-only (get-skill-certification (freelancer principal) (skill-id uint))
+  (map-get? skill-certifications { freelancer: freelancer, skill-id: skill-id })
+)
+
+(define-read-only (get-skill-challenge (challenge-id uint))
+  (map-get? skill-challenges { challenge-id: challenge-id })
+)
+
+(define-read-only (get-challenge-submission (challenge-id uint) (participant principal))
+  (map-get? challenge-submissions { challenge-id: challenge-id, participant: participant })
+)
+
+(define-read-only (get-peer-review (skill-id uint) (candidate principal) (reviewer principal))
+  (map-get? peer-reviews { skill-id: skill-id, candidate: candidate, reviewer: reviewer })
+)
+
+(define-read-only (get-freelancer-skill-portfolio (freelancer principal))
+  (map-get? freelancer-skill-portfolio { freelancer: freelancer })
+)
+
+(define-read-only (get-skill-verification-settings)
+  {
+    min-reviewers-for-verification: (var-get min-reviewers-for-verification),
+    certification-validity-period: (var-get certification-validity-period),
+    next-skill-id: (var-get next-skill-id),
+    next-challenge-id: (var-get next-challenge-id)
+  }
+)
+
+
